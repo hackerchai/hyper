@@ -21,6 +21,8 @@ typedef struct conn_data_s {
     uint32_t event_mask;
     hyper_waker *read_waker;
     hyper_waker *write_waker;
+    hyper_task *conn_task;  // Add this to keep track of the connection task
+    int is_closing;  // Add this flag to prevent double-free
 } conn_data;
 
 typedef struct service_userdata_s {
@@ -53,6 +55,7 @@ static void on_close(uv_handle_t* handle) {
 static void close_conn(uv_handle_t* handle) {
     conn_data* conn = (conn_data*)handle->data;
     if (conn) {
+        printf("Closing connection\n");
         if (conn->read_waker) {
             hyper_waker_free(conn->read_waker);
             conn->read_waker = NULL;
@@ -60,6 +63,10 @@ static void close_conn(uv_handle_t* handle) {
         if (conn->write_waker) {
             hyper_waker_free(conn->write_waker);
             conn->write_waker = NULL;
+        }
+        if (conn->conn_task) {
+            hyper_task_free(conn->conn_task);
+            conn->conn_task = NULL;
         }
         free(conn);
     }
@@ -153,11 +160,13 @@ static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, s
 }
 
 static conn_data *create_conn_data(uv_tcp_t *client) {
-    conn_data *conn = malloc(sizeof(conn_data));
+    conn_data *conn = calloc(1, sizeof(conn_data));
+    if (!conn) {
+        fprintf(stderr, "Failed to allocate conn_data\n");
+        return NULL;
+    }
     memcpy(&conn->stream, client, sizeof(uv_tcp_t));
-    conn->event_mask = 0;
-    conn->read_waker = NULL;
-    conn->write_waker = NULL;
+    conn->is_closing = 0;
 
     int r = uv_poll_init(loop, &conn->poll_handle, client->io_watcher.fd);
     if (r < 0) {
@@ -167,10 +176,10 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
     }
 
     conn->poll_handle.data = conn;
-    conn->stream.data = conn;  // Add this line
+    conn->stream.data = conn;
 
     if (!update_conn_data_registrations(conn, true)) {
-        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
+        uv_close((uv_handle_t*)&conn->poll_handle, NULL);
         free(conn);
         return NULL;
     }
@@ -180,11 +189,15 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
 
 static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
-    if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
-        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
-    }
-    if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-        uv_close((uv_handle_t*)&conn->stream, close_conn);
+    if (conn && !conn->is_closing) {
+        conn->is_closing = 1;
+        printf("Freeing connection data\n");
+        if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
+            uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+        }
+        if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+            uv_close((uv_handle_t*)&conn->stream, close_conn);
+        }
     }
 }
 
@@ -366,6 +379,13 @@ static void on_new_connection(uv_stream_t *server, int status) {
         printf("New incoming connection from (%s:%s)\n", userdata->host, userdata->port);
 
         conn_data *conn = create_conn_data(client);
+        if (!conn) {
+            fprintf(stderr, "Failed to create conn_data\n");
+            uv_close((uv_handle_t*)client, on_close);
+            free_service_userdata(userdata);
+            return;
+        }
+
         hyper_io *io = create_io(conn);
 
         hyper_service *service = hyper_service_new(server_callback);
@@ -379,9 +399,10 @@ static void on_new_connection(uv_stream_t *server, int status) {
         hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
 
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
+        conn->conn_task = serverconn;  // Store the task in conn_data
+        hyper_task_set_userdata(serverconn, conn, free_conn_data);
         hyper_executor_push(userdata->executor, serverconn);
 
-        // Free options after use
         hyper_http1_serverconn_options_free(http1_opts);
         hyper_http2_serverconn_options_free(http2_opts);
     } else {
@@ -447,35 +468,10 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
                 hyper_error_free(err);
             } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
-                                // Connection closed, do necessary cleanup here
                 conn_data *conn = (conn_data *)hyper_task_userdata(task);
                 if (conn != NULL) {
                     printf("Connection closed. Cleaning up resources.\n");
-                    
-                    // Stop the poll handle
-                    uv_poll_stop(&conn->poll_handle);
-                    
-                    // Close the poll handle if it's not already closing
-                    if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
-                        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
-                    }
-                    
-                    // Close the stream if it's not already closing
-                    if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-                        uv_close((uv_handle_t*)&conn->stream, close_conn);
-                    }
-                    
-                    // Free wakers if they exist
-                    if (conn->read_waker) {
-                        hyper_waker_free(conn->read_waker);
-                        conn->read_waker = NULL;
-                    }
-                    if (conn->write_waker) {
-                        hyper_waker_free(conn->write_waker);
-                        conn->write_waker = NULL;
-                    }
-                    
-                    // Note: We don't free conn here because it will be freed in close_conn
+                    free_conn_data(conn);
                 } else {
                     fprintf(stderr, "Warning: Empty task with no associated connection data\n");
                 }
