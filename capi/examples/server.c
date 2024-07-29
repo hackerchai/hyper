@@ -194,7 +194,7 @@ static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
     if (conn && !conn->is_closing) {
         conn->is_closing = 1;
-        printf("Marking connection for closure after %d requests\n", conn->request_count);
+        //printf("Marking connection for closure after %d requests\n", conn->request_count);
         // We don't immediately close the connection here.
         // Instead, we'll let the main loop handle the closure when appropriate.
     }
@@ -488,30 +488,69 @@ int main(int argc, char *argv[]) {
 
         hyper_task *task = hyper_executor_poll(exec);
         while (task != NULL) {
-            if (hyper_task_type(task) == HYPER_TASK_ERROR) {
-                hyper_error *err = hyper_task_value(task);
-                uint8_t errbuf[256];
-                size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
-                fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
-                hyper_error_free(err);
-            } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
-                conn_data *conn = (conn_data *)hyper_task_userdata(task);
-                if (conn != NULL) {
-                    if (conn->is_closing) {
-                        printf("Connection marked for closure, cleaning up resources.\n");
-                        if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
-                            uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+            enum hyper_task_return_type task_type = hyper_task_type(task);
+            void *task_userdata = hyper_task_userdata(task);
+
+            switch (task_type) {
+                case HYPER_TASK_EMPTY:
+                    printf("\n");
+                    printf("Empty task received: connection closed\n");
+                    // This might indicate the end of a connection or a completed operation
+                    if (task_userdata) {
+                        conn_data *conn = (conn_data *)task_userdata;
+                        printf("Connection task completed for request %d\n", conn->request_count);
+                        if (!conn->is_closing) {
+                            conn->is_closing = 1;
+                            //printf("Marking connection for closure after %d requests\n", conn->request_count);
+                            if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
+                                uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+                            }
+                            if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+                                uv_close((uv_handle_t*)&conn->stream, close_conn);
+                            }
                         }
-                        if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-                            uv_close((uv_handle_t*)&conn->stream, close_conn);
-                        }
-                    } else {
-                        printf("Task completed, but connection still active.\n");
                     }
-                } else {
-                    fprintf(stderr, "Warning: Empty task with no associated connection data\n");
-                }
+                    break;
+
+                case HYPER_TASK_ERROR:
+                    {
+                        hyper_error *err = hyper_task_value(task);
+                        uint8_t errbuf[256];
+                        size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
+                        fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
+                        hyper_error_free(err);
+                    }
+                    break;
+
+                case HYPER_TASK_CLIENTCONN:
+                    fprintf(stderr, "Unexpected HYPER_TASK_CLIENTCONN in server context\n");
+                    break;
+
+                case HYPER_TASK_RESPONSE:
+                    printf("Response task received\n");
+                    // Handle response if needed
+                    break;
+
+                case HYPER_TASK_BUF:
+                    printf("Buffer task received\n");
+                    // Handle buffer if needed
+                    break;
+
+                case HYPER_TASK_SERVERCONN:
+                    printf("Server connection task received: ready for new connection...\n");
+                    // This indicates a new server-side connection task
+                    // We might want to initialize or set up something here
+                    break;
+
+                default:
+                    fprintf(stderr, "Unknown task type: %d\n", task_type);
+                    break;
             }
+
+            if (task_userdata == NULL && task_type != HYPER_TASK_EMPTY && task_type != HYPER_TASK_SERVERCONN) {
+                fprintf(stderr, "Warning: Task with no associated connection data. Type: %d\n", task_type);
+            }
+
             hyper_task_free(task);
             task = hyper_executor_poll(exec);
         }
