@@ -23,12 +23,14 @@ typedef struct conn_data_s {
     hyper_waker *write_waker;
     hyper_task *conn_task;  // Add this to keep track of the connection task
     int is_closing;  // Add this flag to prevent double-free
+    int request_count;  // Add this to keep track of the number of requests handled
 } conn_data;
 
 typedef struct service_userdata_s {
     char host[128];
     char port[8];
     const hyper_executor *executor;
+    conn_data *conn;  // Add this field to store the connection data
 } service_userdata;
 
 static uv_loop_t *loop;
@@ -55,7 +57,7 @@ static void on_close(uv_handle_t* handle) {
 static void close_conn(uv_handle_t* handle) {
     conn_data* conn = (conn_data*)handle->data;
     if (conn) {
-        printf("Closing connection\n");
+        printf("Closing connection after handling %d requests\n", conn->request_count);
         if (conn->read_waker) {
             hyper_waker_free(conn->read_waker);
             conn->read_waker = NULL;
@@ -167,6 +169,7 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
     }
     memcpy(&conn->stream, client, sizeof(uv_tcp_t));
     conn->is_closing = 0;
+    conn->request_count = 0;
 
     int r = uv_poll_init(loop, &conn->poll_handle, client->io_watcher.fd);
     if (r < 0) {
@@ -191,13 +194,9 @@ static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
     if (conn && !conn->is_closing) {
         conn->is_closing = 1;
-        printf("Freeing connection data\n");
-        if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
-            uv_close((uv_handle_t*)&conn->poll_handle, NULL);
-        }
-        if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-            uv_close((uv_handle_t*)&conn->stream, close_conn);
-        }
+        printf("Marking connection for closure after %d requests\n", conn->request_count);
+        // We don't immediately close the connection here.
+        // Instead, we'll let the main loop handle the closure when appropriate.
     }
 }
 
@@ -211,12 +210,19 @@ static hyper_io *create_io(conn_data *conn) {
 }
 
 static service_userdata *create_service_userdata() {
-    return (service_userdata *)calloc(1, sizeof(service_userdata));
+    service_userdata *userdata = (service_userdata *)calloc(1, sizeof(service_userdata));
+    if (userdata == NULL) {
+        fprintf(stderr, "Failed to allocate service_userdata\n");
+    }
+    return userdata;
 }
 
 static void free_service_userdata(void *userdata) {
     service_userdata *cast_userdata = (service_userdata *)userdata;
-    free(cast_userdata);
+    if (cast_userdata != NULL) {
+        // Note: We don't free conn here because it's managed separately
+        free(cast_userdata);
+    }
 }
 
 static int print_each_header(
@@ -249,6 +255,19 @@ static int send_each_body_chunk(void *userdata, hyper_context *ctx, hyper_buf **
 
 static void server_callback(void *userdata, hyper_request *request, hyper_response_channel *channel) {
     service_userdata *service_data = (service_userdata *)userdata;
+    
+    // We need to change how we access conn_data
+    // Instead of trying to get it from the service, we should pass it directly when creating the service
+    conn_data *conn = (conn_data *)service_data->conn;  // Assume we've added a conn field to service_userdata
+    
+    if (conn == NULL) {
+        fprintf(stderr, "Error: No connection data available\n");
+        return;
+    }
+
+    conn->request_count++;
+    printf("Handling request %d on connection from %s:%s\n", conn->request_count, service_data->host, service_data->port);
+
     printf("Received request from %s:%s\n", service_data->host, service_data->port);
 
     if (request == NULL) {
@@ -347,7 +366,8 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Error: Failed to create response\n");
     }
 
-    hyper_request_free(request);
+   // We don't close the connection here. Let hyper handle keep-alive.
+   //hyper_request_free(request);
 }
 
 static void on_new_connection(uv_stream_t *server, int status) {
@@ -360,6 +380,11 @@ static void on_new_connection(uv_stream_t *server, int status) {
     uv_tcp_init(loop, client);
     if (uv_accept(server, (uv_stream_t*)client) == 0) {
         service_userdata *userdata = create_service_userdata();
+        if (userdata == NULL) {
+            fprintf(stderr, "Failed to create service_userdata\n");
+            uv_close((uv_handle_t*)client, on_close);
+            return;
+        }
         userdata->executor = exec;
 
         struct sockaddr_storage addr;
@@ -385,6 +410,8 @@ static void on_new_connection(uv_stream_t *server, int status) {
             free_service_userdata(userdata);
             return;
         }
+
+        userdata->conn = conn;  // Store the conn_data in service_userdata
 
         hyper_io *io = create_io(conn);
 
@@ -470,8 +497,17 @@ int main(int argc, char *argv[]) {
             } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
                 conn_data *conn = (conn_data *)hyper_task_userdata(task);
                 if (conn != NULL) {
-                    printf("Connection closed. Cleaning up resources.\n");
-                    free_conn_data(conn);
+                    if (conn->is_closing) {
+                        printf("Connection marked for closure, cleaning up resources.\n");
+                        if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
+                            uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+                        }
+                        if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+                            uv_close((uv_handle_t*)&conn->stream, close_conn);
+                        }
+                    } else {
+                        printf("Task completed, but connection still active.\n");
+                    }
                 } else {
                     fprintf(stderr, "Warning: Empty task with no associated connection data\n");
                 }
@@ -479,6 +515,9 @@ int main(int argc, char *argv[]) {
             hyper_task_free(task);
             task = hyper_executor_poll(exec);
         }
+
+        // Handle any pending closures
+        uv_run(loop, UV_RUN_NOWAIT);
     }
 
     // Cleanup
