@@ -50,12 +50,47 @@ static void on_close(uv_handle_t* handle) {
     free(handle);
 }
 
+static void close_conn(uv_handle_t* handle) {
+    conn_data* conn = (conn_data*)handle->data;
+    if (conn) {
+        if (conn->read_waker) {
+            hyper_waker_free(conn->read_waker);
+            conn->read_waker = NULL;
+        }
+        if (conn->write_waker) {
+            hyper_waker_free(conn->write_waker);
+            conn->write_waker = NULL;
+        }
+        free(conn);
+    }
+    free(handle);
+}
+
+static void on_poll(uv_poll_t* handle, int status, int events) {
+    conn_data* conn = (conn_data*)handle->data;
+    
+    if (status < 0) {
+        fprintf(stderr, "Poll error: %s\n", uv_strerror(status));
+        return;
+    }
+
+    if (events & UV_READABLE && conn->read_waker) {
+        hyper_waker_wake(conn->read_waker);
+        conn->read_waker = NULL;
+    }
+
+    if (events & UV_WRITABLE && conn->write_waker) {
+        hyper_waker_wake(conn->write_waker);
+        conn->write_waker = NULL;
+    }
+}
+
 static bool update_conn_data_registrations(conn_data *conn, bool create) {
     int events = 0;
     if (conn->event_mask & UV_READABLE) events |= UV_READABLE;
     if (conn->event_mask & UV_WRITABLE) events |= UV_WRITABLE;
 
-    int r = uv_poll_start(&conn->poll_handle, events, NULL);
+    int r = uv_poll_start(&conn->poll_handle, events, on_poll);
     if (r < 0) {
         fprintf(stderr, "uv_poll_start error: %s\n", uv_strerror(r));
         return false;
@@ -131,8 +166,11 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
         return NULL;
     }
 
+    conn->poll_handle.data = conn;
+    conn->stream.data = conn;  // Add this line
+
     if (!update_conn_data_registrations(conn, true)) {
-        uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
         free(conn);
         return NULL;
     }
@@ -142,22 +180,12 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
 
 static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
-
-    uv_poll_stop(&conn->poll_handle);
-    uv_close((uv_handle_t*)&conn->poll_handle, NULL);
-
-    if (conn->read_waker) {
-        hyper_waker_free(conn->read_waker);
-        conn->read_waker = NULL;
+    if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
+        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
     }
-    if (conn->write_waker) {
-        hyper_waker_free(conn->write_waker);
-        conn->write_waker = NULL;
+    if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+        uv_close((uv_handle_t*)&conn->stream, close_conn);
     }
-
-    uv_close((uv_handle_t*)&conn->stream, NULL);
-
-    free(conn);
 }
 
 static hyper_io *create_io(conn_data *conn) {
@@ -210,13 +238,11 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
     service_userdata *service_data = (service_userdata *)userdata;
     printf("Received request from %s:%s\n", service_data->host, service_data->port);
 
-    // 检查请求是否为 NULL
     if (request == NULL) {
         fprintf(stderr, "Error: Received null request\n");
         return;
     }
 
-    // 获取并打印 URI 部分
     uint8_t scheme[64] = {0};
     uint8_t authority[256] = {0};
     uint8_t path_and_query[1024] = {0};
@@ -233,7 +259,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Failed to get URI parts. Error code: %d\n", uri_result);
     }
 
-    // 获取并打印 HTTP 版本
     int version = hyper_request_version(request);
     printf("HTTP Version: ");
     switch(version) {
@@ -244,7 +269,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         default: printf("Unknown (%d)\n", version);
     }
 
-    // 获取并打印请求方法
     uint8_t method[32] = {0};
     size_t method_len = sizeof(method);
     enum hyper_code method_result = hyper_request_method(request, method, &method_len);
@@ -254,7 +278,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Failed to get request method. Error code: %d\n", method_result);
     }
 
-    // 打印所有请求头
     printf("Headers:\n");
     hyper_headers *req_headers = hyper_request_headers(request);
     if (req_headers != NULL) {
@@ -263,7 +286,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Error: Failed to get request headers\n");
     }
 
-    // 处理请求体（如果是 POST 或 PUT 请求）
     if (method_len > 0 && (strncmp((char *)method, "POST", method_len) == 0 || strncmp((char *)method, "PUT", method_len) == 0)) {
         printf("Request Body:\n");
         hyper_body *body = hyper_request_body(request);
@@ -279,7 +301,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         }
     }
 
-    // 创建响应
     hyper_response *response = hyper_response_new();
     if (response != NULL) {
         hyper_response_set_status(response, 200);
@@ -291,14 +312,13 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
             fprintf(stderr, "Error: Failed to get response headers\n");
         }
 
-        // 设置响应体
         if (method_len > 0 && strncmp((char *)method, "GET", method_len) == 0) {
             hyper_body *body = hyper_body_new();
             if (body != NULL) {
                 hyper_body_set_data_func(body, send_each_body_chunk);
                 int *chunk_count = (int *)malloc(sizeof(int));
                 if (chunk_count != NULL) {
-                    *chunk_count = 10; // 减少响应体大小以便于测试
+                    *chunk_count = 10;
                     hyper_body_set_userdata(body, (void *)chunk_count, free);
                     hyper_response_set_body(response, body);
                 } else {
@@ -309,13 +329,11 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
             }
         }
 
-        // 发送响应
         hyper_response_channel_send(channel, response);
     } else {
         fprintf(stderr, "Error: Failed to create response\n");
     }
 
-    // 清理
     hyper_request_free(request);
 }
 
@@ -362,6 +380,10 @@ static void on_new_connection(uv_stream_t *server, int status) {
 
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
         hyper_executor_push(userdata->executor, serverconn);
+
+        // Free options after use
+        hyper_http1_serverconn_options_free(http1_opts);
+        hyper_http2_serverconn_options_free(http2_opts);
     } else {
         uv_close((uv_handle_t*)client, on_close);
     }
@@ -412,22 +434,60 @@ int main(int argc, char *argv[]) {
     uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
 
     printf("http handshake (hyper v%s) ...\n", hyper_version());
+    
     while (1) {
         uv_run(loop, UV_RUN_NOWAIT);
 
         hyper_task *task = hyper_executor_poll(exec);
-        if (task != NULL) {
-            fprintf(stderr, "Executor polled a task\n");
+        while (task != NULL) {
             if (hyper_task_type(task) == HYPER_TASK_ERROR) {
                 hyper_error *err = hyper_task_value(task);
                 uint8_t errbuf[256];
                 size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
                 fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
                 hyper_error_free(err);
+            } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
+                                // Connection closed, do necessary cleanup here
+                conn_data *conn = (conn_data *)hyper_task_userdata(task);
+                if (conn != NULL) {
+                    printf("Connection closed. Cleaning up resources.\n");
+                    
+                    // Stop the poll handle
+                    uv_poll_stop(&conn->poll_handle);
+                    
+                    // Close the poll handle if it's not already closing
+                    if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
+                        uv_close((uv_handle_t*)&conn->poll_handle, on_close);
+                    }
+                    
+                    // Close the stream if it's not already closing
+                    if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+                        uv_close((uv_handle_t*)&conn->stream, close_conn);
+                    }
+                    
+                    // Free wakers if they exist
+                    if (conn->read_waker) {
+                        hyper_waker_free(conn->read_waker);
+                        conn->read_waker = NULL;
+                    }
+                    if (conn->write_waker) {
+                        hyper_waker_free(conn->write_waker);
+                        conn->write_waker = NULL;
+                    }
+                    
+                    // Note: We don't free conn here because it will be freed in close_conn
+                } else {
+                    fprintf(stderr, "Warning: Empty task with no associated connection data\n");
+                }
             }
             hyper_task_free(task);
+            task = hyper_executor_poll(exec);
         }
     }
 
-    return uv_run(loop, UV_RUN_DEFAULT);
+    // Cleanup
+    uv_loop_close(loop);
+    hyper_executor_free(exec);
+
+    return 0;
 }
