@@ -36,13 +36,21 @@ typedef struct service_userdata_s {
 static uv_loop_t *loop;
 static uv_tcp_t server;
 static uv_signal_t sigint_handle, sigterm_handle;
+static volatile bool should_exit = false;
 
 static void on_signal(uv_signal_t *handle, int signum) {
     printf("Caught signal %d... exiting\n", signum);
+    should_exit = true;
     uv_signal_stop(&sigint_handle);
     uv_signal_stop(&sigterm_handle);
     uv_close((uv_handle_t*)&server, NULL);
     uv_stop(loop);
+}
+
+static void close_walk_cb(uv_handle_t* handle, void* arg) {
+    if (!uv_is_closing(handle)) {
+        uv_close(handle, NULL);
+    }
 }
 
 static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -487,7 +495,7 @@ int main(int argc, char *argv[]) {
         uv_run(loop, UV_RUN_NOWAIT);
 
         hyper_task *task = hyper_executor_poll(exec);
-        while (task != NULL) {
+        while (task != NULL && !should_exit) {
             enum hyper_task_return_type task_type = hyper_task_type(task);
             void *task_userdata = hyper_task_userdata(task);
 
@@ -552,16 +560,28 @@ int main(int argc, char *argv[]) {
             }
 
             hyper_task_free(task);
-            task = hyper_executor_poll(exec);
+            if (!should_exit) {
+                task = hyper_executor_poll(exec);
+            }
         }
 
+        if (should_exit) {
+            printf("Shutdown initiated, cleaning up...\n");
+            break;
+        }
+        
         // Handle any pending closures
         uv_run(loop, UV_RUN_NOWAIT);
     }
 
     // Cleanup
+    printf("Closing all handles...\n");
+    uv_walk(loop, close_walk_cb, NULL);
+    uv_run(loop, UV_RUN_DEFAULT);
+
     uv_loop_close(loop);
     hyper_executor_free(exec);
 
+    printf("Shutdown complete.\n");
     return 0;
 }
