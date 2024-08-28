@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #include <uv.h>
 
@@ -22,11 +23,11 @@ typedef struct conn_data_s {
     hyper_waker *read_waker;
     hyper_waker *write_waker;
     hyper_task *conn_task;
-    int is_closing;
     uv_buf_t read_buffer;
     size_t read_buffer_filled;
     uv_buf_t write_buffer;
     uv_write_t write_req;
+    atomic_bool is_closing;
 } conn_data;
 
 typedef struct service_userdata_s {
@@ -39,7 +40,7 @@ typedef struct service_userdata_s {
 static uv_loop_t *loop;
 static uv_tcp_t server;
 static uv_signal_t sigint_handle, sigterm_handle;
-static   bool should_exit = false;
+static volatile bool should_exit = false;
 
 static void on_signal(uv_signal_t *handle, int signum) {
     printf("Caught signal %d... exiting\n", signum);
@@ -54,18 +55,6 @@ static void close_walk_cb(uv_handle_t* handle, void* arg) {
     if (!uv_is_closing(handle)) {
         uv_close(handle, NULL);
     }
-}
-
-static void check_handle_status(uv_handle_t* handle) {
-    const char* type_name;
-    switch (handle->type) {
-        case UV_TCP: type_name = "UV_TCP"; break;
-        case UV_NAMED_PIPE: type_name = "UV_NAMED_PIPE"; break;
-        case UV_TTY: type_name = "UV_TTY"; break;
-        default: type_name = "UNKNOWN"; break;
-    }
-    printf("Handle type: %s (%d), is active: %d, is closing: %d\n",
-           type_name, handle->type, uv_is_active(handle), uv_is_closing(handle));
 }
 
 static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
@@ -88,39 +77,6 @@ static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *b
     *buf = uv_buf_init(conn->read_buffer.base + conn->read_buffer_filled, to_alloc);
 }
 
-static void on_close(uv_handle_t* handle) {
-    free(handle);
-}
-
-static void close_conn(uv_handle_t* handle) {
-    conn_data* conn = (conn_data*)handle->data;
-
-    if (conn) {
-        printf("Closing connection...\n");
-        if (conn->read_waker) {
-            hyper_waker_free(conn->read_waker);
-            conn->read_waker = NULL;
-        }
-        if (conn->write_waker) {
-            hyper_waker_free(conn->write_waker);
-            conn->write_waker = NULL;
-        }
-        if (conn->conn_task) {
-            hyper_task_free(conn->conn_task);
-            conn->conn_task = NULL;
-        }
-        if (conn->read_buffer.base) {
-            free(conn->read_buffer.base);
-            conn->read_buffer.base = NULL;
-        }
-        if (conn->write_buffer.base) {
-            free(conn->write_buffer.base);
-            conn->write_buffer.base = NULL;
-        }
-        free(conn);
-    }
-    free(handle);
-}
 
 static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     conn_data *conn = (conn_data *)client->data;
@@ -128,7 +84,11 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     if (nread < 0) {
         if (nread != UV_EOF) {
             fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
-            uv_close((uv_handle_t*)client, close_conn);
+            //uv_close((uv_handle_t*)client, NULL);
+        }
+        if (conn->read_waker) {
+            hyper_waker_wake(conn->read_waker);
+            conn->read_waker = NULL;
         }
     } else if (nread > 0) {
         conn->read_buffer_filled += nread;
@@ -143,13 +103,27 @@ static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t b
     conn_data *conn = (conn_data *)userdata;
     
     // Copy data from the read buffer to the hyper context buffer
+    char *header_end = memmem(conn->read_buffer.base, conn->read_buffer_filled, "\r\n\r\n", 4);
+    if (header_end) {
+        size_t header_length = header_end - conn->read_buffer.base + 4;
+        size_t to_copy = header_length < buf_len ? header_length : buf_len;
+        memcpy(buf, conn->read_buffer.base, to_copy);
+
+        memmove(conn->read_buffer.base, conn->read_buffer.base + to_copy, conn->read_buffer_filled - to_copy);
+        conn->read_buffer_filled -= to_copy;
+
+        printf("Complete header read. Copied %zu bytes.\n", to_copy);
+        return to_copy;
+    }
+
     if (conn->read_buffer_filled > 0) {
         size_t to_copy = conn->read_buffer_filled < buf_len ? conn->read_buffer_filled : buf_len;
         memcpy(buf, conn->read_buffer.base, to_copy);
-        
+
         memmove(conn->read_buffer.base, conn->read_buffer.base + to_copy, conn->read_buffer_filled - to_copy);
         conn->read_buffer_filled -= to_copy;
-        
+
+        printf("Partial data read. Copied %zu bytes.\n", to_copy);
         return to_copy;
     }
     
@@ -211,7 +185,7 @@ static conn_data *create_conn_data() {
         return NULL;
     }
 
-    conn->is_closing = 0;
+    atomic_init(&conn->is_closing, false);
     conn->read_buffer_filled = 0;
 
     return conn;
@@ -219,10 +193,19 @@ static conn_data *create_conn_data() {
 
 static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
-    if (conn && !conn->is_closing) {
-        conn->is_closing = 1;
-        // We don't immediately close the connection here.
-        // Instead, we'll let the main loop handle the closure when appropriate.
+    printf("attempt free_conn_data\n");
+    if (conn && !atomic_exchange(&conn->is_closing, true)) {
+        printf("Closing connection...\n");
+        if (conn->read_waker) {
+            hyper_waker_free(conn->read_waker);
+            conn->read_waker = NULL;
+        }
+        if (conn->write_waker) {
+            hyper_waker_free(conn->write_waker);
+            conn->write_waker = NULL;
+        }
+
+        //free(conn);
     }
 }
 
@@ -256,6 +239,15 @@ static int print_each_header(
 ) {
     printf("%.*s: %.*s\n", (int)name_len, name, (int)value_len, value);
     return HYPER_ITER_CONTINUE;
+}
+
+static void on_close(uv_handle_t* handle) {
+    printf("on_close\n");
+    conn_data *conn = (conn_data *)handle->data;
+    if (conn) {
+        free_conn_data(conn);
+    }
+    free(handle);
 }
 
 static int print_body_chunk(void *userdata, const hyper_buf *chunk) {
@@ -361,6 +353,7 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         if (rsp_headers != NULL) {
             hyper_headers_set(rsp_headers, (unsigned char *)"Content-Type", 12, (unsigned char *)"text/plain", 10);
             hyper_headers_set(rsp_headers, (unsigned char *)"Cache-Control", 13, (unsigned char *)"no-cache", 8);
+            hyper_headers_set(rsp_headers, (unsigned char *)"Connection", 10, (unsigned char *)"keep-alive", 10);
         } else {
             fprintf(stderr, "Error: Failed to get response headers\n");
         }
@@ -387,6 +380,7 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Error: Failed to create response\n");
     }
 
+    hyper_request_free(request);
    // We don't close the connection here. Let hyper handle keep-alive.
 }
 
@@ -404,9 +398,8 @@ static void on_new_connection(uv_stream_t *server, int status) {
     }
 
     uv_tcp_init(loop, &conn->stream);
+    conn->stream.data = conn;
     if (uv_accept(server, (uv_stream_t*)&conn->stream) == 0) {
-        conn->stream.data = conn;
-
         int r = uv_read_start((uv_stream_t*)&conn->stream, alloc_buffer, on_read);
         if (r < 0) {
             fprintf(stderr, "uv_read_start error: %s\n", uv_strerror(r));
@@ -513,24 +506,11 @@ int main(int argc, char *argv[]) {
         hyper_task *task = hyper_executor_poll(exec);
         while (task != NULL && !should_exit) {
             enum hyper_task_return_type task_type = hyper_task_type(task);
-            void *task_userdata = hyper_task_userdata(task);
 
             switch (task_type) {
                 case HYPER_TASK_EMPTY:
-                    printf("\n");
-                    printf("Empty task received: connection closed\n");
-                    // This might indicate the end of a connection or a completed operation
-                    if (task_userdata) {
-                        conn_data *conn = (conn_data *)task_userdata;
-                        printf("Connection task completed for request\n");
-                        if (!conn->is_closing) {
-                            conn->is_closing = 1;
-                            // Remove references to poll_handle
-                            if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-                                uv_close((uv_handle_t*)&conn->stream, close_conn);
-                            }
-                        }
-                    }
+                    printf("internal hyper task complete\n");
+                    hyper_task_free(task);
                     break;
 
                 case HYPER_TASK_ERROR:
@@ -541,41 +521,23 @@ int main(int argc, char *argv[]) {
                         fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
                         hyper_error_free(err);
                     }
-                    break;
-
-                case HYPER_TASK_CLIENTCONN:
-                    fprintf(stderr, "Unexpected HYPER_TASK_CLIENTCONN in server context\n");
-                    break;
-
-                case HYPER_TASK_RESPONSE:
-                    printf("Response task received\n");
-                    // Handle response if needed
-                    break;
-
-                case HYPER_TASK_BUF:
-                    printf("Buffer task received\n");
-                    // Handle buffer if needed
+                    hyper_task_free(task);
                     break;
 
                 case HYPER_TASK_SERVERCONN:
-                    printf("Server connection task received: ready for new connection...\n");
-                    // This indicates a new server-side connection task
-                    // We might want to initialize or set up something here
+                    printf("server connection task complete\n");
+                    hyper_task_free(task);
                     break;
 
                 default:
                     fprintf(stderr, "Unknown task type: %d\n", task_type);
+                    hyper_task_free(task);
                     break;
-            }
-
-            if (task_userdata == NULL && task_type != HYPER_TASK_EMPTY && task_type != HYPER_TASK_SERVERCONN) {
-                fprintf(stderr, "Warning: Task with no associated connection data. Type: %d\n", task_type);
             }
 
             if (!should_exit) {
                 task = hyper_executor_poll(exec);
             }
-            hyper_task_free(task);
         }
 
         if (should_exit) {
