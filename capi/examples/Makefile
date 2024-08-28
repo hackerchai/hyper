@@ -21,6 +21,10 @@ upload: upload.o
 	$(CC) -o $@ $< $(HYPER_LDFLAGS) $(UV_LDFLAGS) $(LDFLAGS) $(LIBS)
 server: server.o
 	$(CC) -o $@ $< $(HYPER_LDFLAGS) $(UV_LDFLAGS) $(LDFLAGS) $(LIBS)
+server_legacy: server_legacy.o
+	$(CC) -o $@ $< $(HYPER_LDFLAGS) $(UV_LDFLAGS) $(LDFLAGS) $(LIBS)
+server_epoll: server_epoll.o
+	$(CC) -o $@ $< $(HYPER_LDFLAGS) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -f *.o client server upload
