@@ -40,6 +40,7 @@ typedef struct service_userdata_s {
 
 static uv_loop_t *loop;
 static uv_tcp_t server;
+static uv_idle_t idle_handle;
 static uv_signal_t sigint_handle, sigterm_handle;
 static volatile bool should_exit = false;
 
@@ -50,6 +51,37 @@ static void on_signal(uv_signal_t *handle, int signum) {
     uv_signal_stop(&sigterm_handle);
     uv_close((uv_handle_t*)&server, NULL);
     uv_stop(loop);
+}
+
+static void on_idle(uv_idle_t* handle) {
+    hyper_task *task = hyper_executor_poll(exec);
+    while (task != NULL) {
+        if (hyper_task_type(task) == HYPER_TASK_ERROR) {
+            printf("hyper task failed with error!\n");
+
+            hyper_error *err = hyper_task_value(task);
+            printf("error code: %d\n", hyper_error_code(err));
+            uint8_t errbuf[256];
+            size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
+            printf("details: %.*s\n", (int)errlen, errbuf);
+
+            hyper_error_free(err);
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
+            printf("internal hyper task complete\n");
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
+            printf("server connection task complete\n");
+            hyper_task_free(task);
+        }
+
+        task = hyper_executor_poll(exec);
+    }
+
+    if (should_exit) {
+        printf("Shutdown initiated, cleaning up...\n");
+        uv_idle_stop(handle);
+    }
 }
 
 static void close_walk_cb(uv_handle_t* handle, void* arg) {
@@ -425,7 +457,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
         hyper_service_set_userdata(service, userdata, free_service_userdata);
 
         hyper_http1_serverconn_options *http1_opts = hyper_http1_serverconn_options_new(userdata->executor);
-        hyper_http1_serverconn_options_header_read_timeout(http1_opts, 1000 * 5);
+        hyper_http1_serverconn_options_header_read_timeout(http1_opts, 5*1000);
         conn->http1_opts = http1_opts;
 
         hyper_http2_serverconn_options *http2_opts = hyper_http2_serverconn_options_new(userdata->executor);
@@ -485,57 +517,12 @@ int main(int argc, char *argv[]) {
     uv_signal_init(loop, &sigterm_handle);
     uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
 
+    uv_idle_init(loop, &idle_handle);
+    uv_idle_start(&idle_handle, on_idle);
+
     printf("http handshake (hyper v%s) ...\n", hyper_version());
-    
-    while (1) {
-        uv_run(loop, UV_RUN_NOWAIT);
-        hyper_task *task = hyper_executor_poll(exec);
-        while (task != NULL && !should_exit) {
-            hyper_task *task = hyper_executor_poll(exec);
-            if (!task) {
-                break;
-            }
 
-            if (hyper_task_type(task) == HYPER_TASK_ERROR) {
-                printf("hyper task failed with error!\n");
-
-                hyper_error *err = hyper_task_value(task);
-                printf("error code: %d\n", hyper_error_code(err));
-                uint8_t errbuf[256];
-                size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
-                printf("details: %.*s\n", (int)errlen, errbuf);
-
-                // clean up the error
-                hyper_error_free(err);
-
-                // clean up the task
-                hyper_task_free(task);
-
-                continue;
-            }
-
-            if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
-                printf("internal hyper task complete\n");
-                hyper_task_free(task);
-
-                continue;
-            }
-
-            if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
-                printf("server connection task complete\n");
-                hyper_task_free(task);
-
-                continue;
-            }
-        }
-
-        if (should_exit) {
-            printf("Shutdown initiated, cleaning up...\n");
-            // Handle any pending closures
-            uv_run(loop, UV_RUN_NOWAIT);
-            break;
-        }
-    }
+    uv_run(loop, UV_RUN_DEFAULT);
 
     // Cleanup
     printf("Closing all handles...\n");
