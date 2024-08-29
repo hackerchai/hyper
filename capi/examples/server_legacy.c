@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
 #include <uv.h>
 
@@ -21,9 +22,9 @@ typedef struct conn_data_s {
     uint32_t event_mask;
     hyper_waker *read_waker;
     hyper_waker *write_waker;
-    hyper_task *conn_task;  // Add this to keep track of the connection task
-    int is_closing;  // Add this flag to prevent double-free
-    int request_count;  // Add this to keep track of the number of requests handled
+    hyper_http1_serverconn_options *http1_opts;
+    hyper_http2_serverconn_options *http2_opts;
+    atomic_bool is_closing;  // Add this flag to prevent double-free
 } conn_data;
 
 typedef struct service_userdata_s {
@@ -35,6 +36,7 @@ typedef struct service_userdata_s {
 
 static uv_loop_t *loop;
 static uv_tcp_t server;
+static uv_idle_t idle_handle;
 static uv_signal_t sigint_handle, sigterm_handle;
 static volatile bool should_exit = false;
 
@@ -51,11 +53,6 @@ static void close_walk_cb(uv_handle_t* handle, void* arg) {
     if (!uv_is_closing(handle)) {
         uv_close(handle, NULL);
     }
-}
-
-static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    buf->base = malloc(suggested_size);
-    buf->len = suggested_size;
 }
 
 static void on_close(uv_handle_t* handle) {
@@ -148,31 +145,14 @@ static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, s
     return HYPER_IO_PENDING;
 }
 
-static conn_data *create_conn_data(uv_tcp_t *client) {
+static conn_data *create_conn_data() {
     conn_data *conn = calloc(1, sizeof(conn_data));
     if (!conn) {
         fprintf(stderr, "Failed to allocate conn_data\n");
         return NULL;
     }
-    memcpy(&conn->stream, client, sizeof(uv_tcp_t));
-    conn->is_closing = 0;
-    conn->request_count = 0;
 
-    int r = uv_poll_init(loop, &conn->poll_handle, client->io_watcher.fd);
-    if (r < 0) {
-        fprintf(stderr, "uv_poll_init error: %s\n", uv_strerror(r));
-        free(conn);
-        return NULL;
-    }
-
-    conn->poll_handle.data = conn;
-    conn->stream.data = conn;
-
-    if (!update_conn_data_registrations(conn, true)) {
-        uv_close((uv_handle_t*)&conn->poll_handle, NULL);
-        free(conn);
-        return NULL;
-    }
+    atomic_init(&conn->is_closing, false);
 
     return conn;
 }
@@ -180,7 +160,7 @@ static conn_data *create_conn_data(uv_tcp_t *client) {
 static void free_conn_data(void *userdata) {
     conn_data *conn = (conn_data *)userdata;
 
-    if (conn) {
+    if (conn && !atomic_exchange(&conn->is_closing, true)) {
         printf("Closing connection...\n");
         if (conn->read_waker) {
             hyper_waker_free(conn->read_waker);
@@ -190,6 +170,14 @@ static void free_conn_data(void *userdata) {
             hyper_waker_free(conn->write_waker);
             conn->write_waker = NULL;
         }
+
+        hyper_http1_serverconn_options_free(conn->http1_opts);
+        hyper_http2_serverconn_options_free(conn->http2_opts);
+
+        // if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+        //     printf("Closing connection stream...\n");
+        //     uv_close((uv_handle_t*)&conn->stream, on_close);
+        // }
         //free(conn);
     }
 }
@@ -259,10 +247,7 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         return;
     }
 
-    conn->request_count++;
-    printf("Handling request %d on connection from %s:%s\n", conn->request_count, service_data->host, service_data->port);
-
-    printf("Received request from %s:%s\n", service_data->host, service_data->port);
+    printf("Handling request on connection from %s:%s\n", service_data->host, service_data->port);
 
     if (request == NULL) {
         fprintf(stderr, "Error: Received null request\n");
@@ -327,6 +312,8 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         }
     }
 
+    hyper_request_free(request);
+
     hyper_response *response = hyper_response_new();
     if (response != NULL) {
         hyper_response_set_status(response, 200);
@@ -361,7 +348,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
     }
 
    // We don't close the connection here. Let hyper handle keep-alive.
-   //hyper_request_free(request);
 }
 
 static void on_new_connection(uv_stream_t *server, int status) {
@@ -370,20 +356,45 @@ static void on_new_connection(uv_stream_t *server, int status) {
         return;
     }
 
-    uv_tcp_t *client = (uv_tcp_t*)malloc(sizeof(uv_tcp_t));
-    uv_tcp_init(loop, client);
-    if (uv_accept(server, (uv_stream_t*)client) == 0) {
+    conn_data *conn = create_conn_data();
+    if (!conn) {
+        fprintf(stderr, "Failed to create conn_data\n");
+        uv_close((uv_handle_t*)&conn->stream, on_close);
+        return;
+    }
+
+    uv_tcp_init(loop, &conn->stream);
+    conn->stream.data = conn;
+    
+    if (uv_accept(server, (uv_stream_t*)&conn->stream) == 0) {
+        int r = uv_poll_init(loop, &conn->poll_handle, conn->stream.io_watcher.fd);
+        if (r < 0) {
+            printf("on_new_connection: uv_poll_init error\n");
+            fprintf(stderr, "uv_poll_init error: %s\n", uv_strerror(r));
+            free(conn);
+            return;
+        }
+
+        conn->poll_handle.data = conn;
+
+        if (!update_conn_data_registrations(conn, true)) {
+            uv_close((uv_handle_t*)&conn->poll_handle, NULL);
+            free(conn);
+            return;
+        }
+
         service_userdata *userdata = create_service_userdata();
         if (userdata == NULL) {
             fprintf(stderr, "Failed to create service_userdata\n");
-            uv_close((uv_handle_t*)client, on_close);
+            uv_close((uv_handle_t*)&conn->stream, on_close);
             return;
         }
         userdata->executor = exec;
+        userdata->conn = conn;
 
         struct sockaddr_storage addr;
         int addrlen = sizeof(addr);
-        uv_tcp_getpeername(client, (struct sockaddr*)&addr, &addrlen);
+        uv_tcp_getpeername(&conn->stream, (struct sockaddr*)&addr, &addrlen);
 
         if (addr.ss_family == AF_INET) {
             struct sockaddr_in *s = (struct sockaddr_in *)&addr;
@@ -396,16 +407,6 @@ static void on_new_connection(uv_stream_t *server, int status) {
         }
 
         printf("New incoming connection from (%s:%s)\n", userdata->host, userdata->port);
-
-        conn_data *conn = create_conn_data(client);
-        if (!conn) {
-            fprintf(stderr, "Failed to create conn_data\n");
-            uv_close((uv_handle_t*)client, on_close);
-            free_service_userdata(userdata);
-            return;
-        }
-
-        userdata->conn = conn;  // Store the conn_data in service_userdata
 
         hyper_io *io = create_io(conn);
 
@@ -420,14 +421,41 @@ static void on_new_connection(uv_stream_t *server, int status) {
         hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
 
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
-        conn->conn_task = serverconn;  // Store the task in conn_data
         hyper_task_set_userdata(serverconn, conn, free_conn_data);
         hyper_executor_push(userdata->executor, serverconn);
-
-        hyper_http1_serverconn_options_free(http1_opts);
-        hyper_http2_serverconn_options_free(http2_opts);
     } else {
-        uv_close((uv_handle_t*)client, on_close);
+        uv_close((uv_handle_t*)&conn->stream, on_close);
+    }
+}
+
+static void on_idle(uv_idle_t* handle) {
+    hyper_task *task = hyper_executor_poll(exec);
+    while (task != NULL) {
+        if (hyper_task_type(task) == HYPER_TASK_ERROR) {
+            printf("hyper task failed with error!\n");
+
+            hyper_error *err = hyper_task_value(task);
+            printf("error code: %d\n", hyper_error_code(err));
+            uint8_t errbuf[256];
+            size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
+            printf("details: %.*s\n", (int)errlen, errbuf);
+
+            hyper_error_free(err);
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
+            printf("internal hyper task complete\n");
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
+            printf("server connection task complete\n");
+            hyper_task_free(task);
+        }
+
+        task = hyper_executor_poll(exec);
+    }
+
+    if (should_exit) {
+        printf("Shutdown initiated, cleaning up...\n");
+        uv_idle_stop(handle);
     }
 }
 
@@ -475,56 +503,12 @@ int main(int argc, char *argv[]) {
     uv_signal_init(loop, &sigterm_handle);
     uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
 
+    uv_idle_init(loop, &idle_handle);
+    uv_idle_start(&idle_handle, on_idle);
+
     printf("http handshake (hyper v%s) ...\n", hyper_version());
     
-    while (1) {
-        uv_run(loop, UV_RUN_NOWAIT);
-
-        hyper_task *task = hyper_executor_poll(exec);
-        while (task != NULL && !should_exit) {
-            enum hyper_task_return_type task_type = hyper_task_type(task);
-
-            switch (task_type) {
-                case HYPER_TASK_EMPTY:
-                    printf("internal hyper task complete\n");
-                    hyper_task_free(task);
-                    break;
-
-                case HYPER_TASK_ERROR:
-                    {
-                        hyper_error *err = hyper_task_value(task);
-                        uint8_t errbuf[256];
-                        size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
-                        fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
-                        hyper_error_free(err);
-                    }
-                    hyper_task_free(task);
-                    break;
-
-                case HYPER_TASK_SERVERCONN:
-                    printf("server connection task complete\n");
-                    hyper_task_free(task);
-                    break;
-
-                default:
-                    fprintf(stderr, "Unknown task type: %d\n", task_type);
-                    hyper_task_free(task);
-                    break;
-            }
-
-            if (!should_exit) {
-                task = hyper_executor_poll(exec);
-            }
-        }
-
-        if (should_exit) {
-            printf("Shutdown initiated, cleaning up...\n");
-            break;
-        }
-        
-        // Handle any pending closures
-        uv_run(loop, UV_RUN_NOWAIT);
-    }
+    uv_run(loop, UV_RUN_DEFAULT);
 
     // Cleanup
     printf("Closing all handles...\n");
