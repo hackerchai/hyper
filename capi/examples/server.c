@@ -24,7 +24,6 @@ typedef struct conn_data_s {
     hyper_waker *write_waker;
     hyper_http1_serverconn_options *http1_opts;
     hyper_http2_serverconn_options *http2_opts;
-    hyper_task *conn_task;
     uv_buf_t read_buf;
     size_t data_len;
     uv_buf_t write_buf;
@@ -435,7 +434,6 @@ static void on_new_connection(uv_stream_t *server, int status) {
         conn->http2_opts = http2_opts;
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
 
-        conn->conn_task = serverconn;
         hyper_task_set_userdata(serverconn, conn, free_conn_data);
         hyper_executor_push(userdata->executor, serverconn);
     } else {
@@ -493,7 +491,7 @@ int main(int argc, char *argv[]) {
         uv_run(loop, UV_RUN_NOWAIT);
         hyper_task *task = hyper_executor_poll(exec);
         while (task != NULL && !should_exit) {
-            //hyper_task *task = hyper_executor_poll(exec);
+            hyper_task *task = hyper_executor_poll(exec);
             if (!task) {
                 break;
             }
