@@ -365,7 +365,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
 
     uv_tcp_init(loop, &conn->stream);
     conn->stream.data = conn;
-    
+
     if (uv_accept(server, (uv_stream_t*)&conn->stream) == 0) {
         int r = uv_poll_init(loop, &conn->poll_handle, conn->stream.io_watcher.fd);
         if (r < 0) {
@@ -415,10 +415,12 @@ static void on_new_connection(uv_stream_t *server, int status) {
 
         hyper_http1_serverconn_options *http1_opts = hyper_http1_serverconn_options_new(userdata->executor);
         hyper_http1_serverconn_options_header_read_timeout(http1_opts, 1000 * 5);
+        conn->http1_opts = http1_opts;
 
         hyper_http2_serverconn_options *http2_opts = hyper_http2_serverconn_options_new(userdata->executor);
         hyper_http2_serverconn_options_keep_alive_interval(http2_opts, 5);
         hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
+        conn->http2_opts = http2_opts;
 
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
         hyper_task_set_userdata(serverconn, conn, free_conn_data);
