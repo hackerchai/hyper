@@ -22,6 +22,8 @@ typedef struct conn_data_s {
     uv_tcp_t stream;
     hyper_waker *read_waker;
     hyper_waker *write_waker;
+    hyper_http1_serverconn_options *http1_opts;
+    hyper_http2_serverconn_options *http2_opts;
     hyper_task *conn_task;
     uv_buf_t read_buf;
     size_t data_len;
@@ -190,6 +192,9 @@ static void free_conn_data(void *userdata) {
         if (conn->write_buf.base) {
             uv_cancel((uv_req_t*)&conn->write_req);
         }
+        
+        hyper_http1_serverconn_options_free(conn->http1_opts);
+        hyper_http2_serverconn_options_free(conn->http2_opts);
 
        //free(conn);
     }
@@ -422,19 +427,17 @@ static void on_new_connection(uv_stream_t *server, int status) {
 
         hyper_http1_serverconn_options *http1_opts = hyper_http1_serverconn_options_new(userdata->executor);
         hyper_http1_serverconn_options_header_read_timeout(http1_opts, 1000 * 5);
+        conn->http1_opts = http1_opts;
 
         hyper_http2_serverconn_options *http2_opts = hyper_http2_serverconn_options_new(userdata->executor);
         hyper_http2_serverconn_options_keep_alive_interval(http2_opts, 5);
         hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
-
+        conn->http2_opts = http2_opts;
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
 
         conn->conn_task = serverconn;
         hyper_task_set_userdata(serverconn, conn, free_conn_data);
         hyper_executor_push(userdata->executor, serverconn);
-
-        hyper_http1_serverconn_options_free(http1_opts);
-        hyper_http2_serverconn_options_free(http2_opts);
     } else {
         uv_close((uv_handle_t*)&conn->stream, on_close);
     }
@@ -488,57 +491,57 @@ int main(int argc, char *argv[]) {
     
     while (1) {
         uv_run(loop, UV_RUN_NOWAIT);
-
         hyper_task *task = hyper_executor_poll(exec);
         while (task != NULL && !should_exit) {
-            enum hyper_task_return_type task_type = hyper_task_type(task);
-
-            switch (task_type) {
-                case HYPER_TASK_EMPTY:
-                    printf("internal hyper task complete\n");
-                    hyper_task_free(task);
-                    break;
-
-                case HYPER_TASK_ERROR:
-                    {
-                        hyper_error *err = hyper_task_value(task);
-                        uint8_t errbuf[256];
-                        size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
-                        fprintf(stderr, "Task error: %.*s\n", (int)errlen, errbuf);
-                        hyper_error_free(err);
-                    }
-                    hyper_task_free(task);
-                    break;
-
-                case HYPER_TASK_SERVERCONN:
-                    printf("server connection task complete\n");
-                    hyper_task_free(task);
-                    break;
-
-                default:
-                    fprintf(stderr, "Unknown task type: %d\n", task_type);
-                    hyper_task_free(task);
-                    break;
+            //hyper_task *task = hyper_executor_poll(exec);
+            if (!task) {
+                break;
             }
 
-            if (!should_exit) {
-                task = hyper_executor_poll(exec);
+            if (hyper_task_type(task) == HYPER_TASK_ERROR) {
+                printf("hyper task failed with error!\n");
+
+                hyper_error *err = hyper_task_value(task);
+                printf("error code: %d\n", hyper_error_code(err));
+                uint8_t errbuf[256];
+                size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
+                printf("details: %.*s\n", (int)errlen, errbuf);
+
+                // clean up the error
+                hyper_error_free(err);
+
+                // clean up the task
+                hyper_task_free(task);
+
+                continue;
+            }
+
+            if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
+                printf("internal hyper task complete\n");
+                hyper_task_free(task);
+
+                continue;
+            }
+
+            if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
+                printf("server connection task complete\n");
+                hyper_task_free(task);
+
+                continue;
             }
         }
 
         if (should_exit) {
             printf("Shutdown initiated, cleaning up...\n");
+            // Handle any pending closures
+            uv_run(loop, UV_RUN_NOWAIT);
             break;
         }
-        
-        // Handle any pending closures
-        uv_run(loop, UV_RUN_NOWAIT);
     }
 
     // Cleanup
     printf("Closing all handles...\n");
     uv_walk(loop, close_walk_cb, NULL);
-    uv_run(loop, UV_RUN_DEFAULT);
 
     uv_loop_close(loop);
     hyper_executor_free(exec);
