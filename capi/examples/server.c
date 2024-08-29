@@ -23,9 +23,9 @@ typedef struct conn_data_s {
     hyper_waker *read_waker;
     hyper_waker *write_waker;
     hyper_task *conn_task;
-    uv_buf_t read_buffer;
-    size_t read_buffer_filled;
-    uv_buf_t write_buffer;
+    uv_buf_t read_buf;
+    size_t data_len;
+    uv_buf_t write_buf;
     uv_write_t write_req;
     atomic_bool is_closing;
 } conn_data;
@@ -60,22 +60,16 @@ static void close_walk_cb(uv_handle_t* handle, void* arg) {
 static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     conn_data *conn = (conn_data *)handle->data;
     
-    if (conn->read_buffer.base == NULL) {
-        conn->read_buffer.base = (char*)malloc(READ_BUFFER_SIZE);
-        if (conn->read_buffer.base == NULL) {
-            fprintf(stderr, "Failed to allocate read buffer\n");
-            *buf = uv_buf_init(NULL, 0);
-            return;
-        }
-        conn->read_buffer.len = READ_BUFFER_SIZE;
-        conn->read_buffer_filled = 0;
+    if (conn->read_buf.base == NULL) {
+        conn->read_buf = uv_buf_init((char*)malloc(suggested_size), suggested_size);
+    } else if (suggested_size > conn->read_buf.len) {
+        free(conn->read_buf.base);
+        conn->read_buf = uv_buf_init((char*)malloc(suggested_size), suggested_size);
     }
     
-    size_t available = READ_BUFFER_SIZE - conn->read_buffer_filled;
-    size_t to_alloc = (available < suggested_size) ? available : suggested_size;
-    
-    *buf = uv_buf_init(conn->read_buffer.base + conn->read_buffer_filled, to_alloc);
+    *buf = uv_buf_init(conn->read_buf.base + conn->data_len, conn->read_buf.len - conn->data_len);
 }
+
 
 
 static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
@@ -84,14 +78,17 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     if (nread < 0) {
         if (nread != UV_EOF) {
             fprintf(stderr, "Read error: %s\n", uv_strerror(nread));
-            //uv_close((uv_handle_t*)client, NULL);
         }
         if (conn->read_waker) {
             hyper_waker_wake(conn->read_waker);
             conn->read_waker = NULL;
         }
-    } else if (nread > 0) {
-        conn->read_buffer_filled += nread;
+        return;
+    }
+
+    if (nread > 0) {
+        conn->data_len += nread;
+        printf("Read %zd bytes. Total in buffer: %zu\n", nread, conn->data_len);
         if (conn->read_waker) {
             hyper_waker_wake(conn->read_waker);
             conn->read_waker = NULL;
@@ -101,37 +98,22 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
 
 static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t buf_len) {
     conn_data *conn = (conn_data *)userdata;
-    
-    // Copy data from the read buffer to the hyper context buffer
-    char *header_end = memmem(conn->read_buffer.base, conn->read_buffer_filled, "\r\n\r\n", 4);
-    if (header_end) {
-        size_t header_length = header_end - conn->read_buffer.base + 4;
-        size_t to_copy = header_length < buf_len ? header_length : buf_len;
-        memcpy(buf, conn->read_buffer.base, to_copy);
 
-        memmove(conn->read_buffer.base, conn->read_buffer.base + to_copy, conn->read_buffer_filled - to_copy);
-        conn->read_buffer_filled -= to_copy;
+    if (conn->data_len > 0) {
+        size_t to_copy = conn->data_len < buf_len ? conn->data_len : buf_len;
+        memcpy(buf, conn->read_buf.base, to_copy);
 
-        printf("Complete header read. Copied %zu bytes.\n", to_copy);
+        memmove(conn->read_buf.base, conn->read_buf.base + to_copy, conn->data_len - to_copy);
+        conn->data_len -= to_copy;
+
+        printf("Copied %zu bytes to Hyper. Remaining in buffer: %zu\n", to_copy, conn->data_len);
         return to_copy;
     }
 
-    if (conn->read_buffer_filled > 0) {
-        size_t to_copy = conn->read_buffer_filled < buf_len ? conn->read_buffer_filled : buf_len;
-        memcpy(buf, conn->read_buffer.base, to_copy);
-
-        memmove(conn->read_buffer.base, conn->read_buffer.base + to_copy, conn->read_buffer_filled - to_copy);
-        conn->read_buffer_filled -= to_copy;
-
-        printf("Partial data read. Copied %zu bytes.\n", to_copy);
-        return to_copy;
-    }
-    
-    // Set the read waker
     if (conn->read_waker != NULL) {
         hyper_waker_free(conn->read_waker);
     }
-    
+
     conn->read_waker = hyper_context_waker(ctx);
     return HYPER_IO_PENDING;
 }
@@ -139,18 +121,12 @@ static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t b
 static void on_write(uv_write_t* req, int status) {
     conn_data* conn = (conn_data*)req->data;
 
-    // Check if the handle matches
-    if (req->handle != (uv_stream_t*)&conn->stream) {
-        fprintf(stderr, "Handle mismatch: expected %p, got %p\n", (uv_stream_t*)&conn->stream, req->handle);
-        return;
-    }
-
-    // Check if the status is less than 0
     if (status < 0) {
         fprintf(stderr, "Write completed with error: %s\n", uv_strerror(status));
     }
-    
-    // Wake up the write waker
+
+    conn->write_buf = uv_buf_init(NULL, 0);
+
     if (conn->write_waker) {
         hyper_waker_wake(conn->write_waker);
         conn->write_waker = NULL;
@@ -160,22 +136,25 @@ static void on_write(uv_write_t* req, int status) {
 static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, size_t buf_len) {
     conn_data *conn = (conn_data *)userdata;
 
-    conn->write_buffer = uv_buf_init((char*)buf, buf_len);
+    if (conn->write_buf.base != NULL) {
+        if (conn->write_waker != NULL) {
+            hyper_waker_free(conn->write_waker);
+        }
+        conn->write_waker = hyper_context_waker(ctx);
+        return HYPER_IO_PENDING;
+    }
+
+    conn->write_buf = uv_buf_init((char*)buf, buf_len);
     conn->write_req.data = conn;
 
-    // Initiate the write operation
-    int r = uv_write(&conn->write_req, (uv_stream_t*)&conn->stream, &conn->write_buffer, 1, on_write);
-    if (r >= 0) {
-        return buf_len;
+    int r = uv_write(&conn->write_req, (uv_stream_t*)&conn->stream, &conn->write_buf, 1, on_write);
+    if (r < 0) {
+        fprintf(stderr, "Write error: %s\n", uv_strerror(r));
+        conn->write_buf = uv_buf_init(NULL, 0);
+        return 0;
     }
 
-    // Set the write_waker
-    if (conn->write_waker != NULL) {
-        hyper_waker_free(conn->write_waker);
-    }
-    conn->write_waker = hyper_context_waker(ctx);
-
-    return HYPER_IO_PENDING;
+    return buf_len;
 }
 
 static conn_data *create_conn_data() {
@@ -186,7 +165,9 @@ static conn_data *create_conn_data() {
     }
 
     atomic_init(&conn->is_closing, false);
-    conn->read_buffer_filled = 0;
+    conn->read_buf = uv_buf_init(NULL, 0);
+    conn->write_buf = uv_buf_init(NULL, 0);
+    conn->data_len = 0;
 
     return conn;
 }
@@ -205,7 +186,12 @@ static void free_conn_data(void *userdata) {
             conn->write_waker = NULL;
         }
 
-        //free(conn);
+        free(conn->read_buf.base);
+        if (conn->write_buf.base) {
+            uv_cancel((uv_req_t*)&conn->write_req);
+        }
+
+       //free(conn);
     }
 }
 
