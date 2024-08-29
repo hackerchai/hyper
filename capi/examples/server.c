@@ -44,52 +44,34 @@ static uv_idle_t idle_handle;
 static uv_signal_t sigint_handle, sigterm_handle;
 static volatile bool should_exit = false;
 
-static void on_signal(uv_signal_t *handle, int signum) {
-    printf("Caught signal %d... exiting\n", signum);
-    should_exit = true;
-    uv_signal_stop(&sigint_handle);
-    uv_signal_stop(&sigterm_handle);
-    uv_close((uv_handle_t*)&server, NULL);
-    uv_stop(loop);
-}
+// UV callback functions
+static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf);
+static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf);
+static void on_write(uv_write_t* req, int status);
+static void on_close(uv_handle_t* handle);
+static void on_new_connection(uv_stream_t *server, int status);
+static void on_signal(uv_signal_t *handle, int signum);
+static void on_idle(uv_idle_t* handle);
+static void close_walk_cb(uv_handle_t* handle, void* arg);
 
-static void on_idle(uv_idle_t* handle) {
-    hyper_task *task = hyper_executor_poll(exec);
-    while (task != NULL) {
-        if (hyper_task_type(task) == HYPER_TASK_ERROR) {
-            printf("hyper task failed with error!\n");
+// Hyper callback functions
+static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t buf_len);
+static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, size_t buf_len);
+static int print_each_header(void *userdata, const uint8_t *name, size_t name_len, const uint8_t *value, size_t value_len);
+static int print_body_chunk(void *userdata, const hyper_buf *chunk);
+static int send_each_body_chunk(void *userdata, hyper_context *ctx, hyper_buf **chunk);
+static void server_callback(void *userdata, hyper_request *request, hyper_response_channel *channel);
 
-            hyper_error *err = hyper_task_value(task);
-            printf("error code: %d\n", hyper_error_code(err));
-            uint8_t errbuf[256];
-            size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
-            printf("details: %.*s\n", (int)errlen, errbuf);
+// Cleanup functions
+static void free_service_userdata(void *userdata);
+static void free_conn_data(void *userdata);
 
-            hyper_error_free(err);
-            hyper_task_free(task);
-        } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
-            printf("internal hyper task complete\n");
-            hyper_task_free(task);
-        } else if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
-            printf("server connection task complete\n");
-            hyper_task_free(task);
-        }
+// Create functions
+static conn_data *create_conn_data();
+static hyper_io *create_io(conn_data *conn);
+static service_userdata *create_service_userdata();
 
-        task = hyper_executor_poll(exec);
-    }
-
-    if (should_exit) {
-        printf("Shutdown initiated, cleaning up...\n");
-        uv_idle_stop(handle);
-    }
-}
-
-static void close_walk_cb(uv_handle_t* handle, void* arg) {
-    if (!uv_is_closing(handle)) {
-        uv_close(handle, NULL);
-    }
-}
-
+// uv callback for alloc buffer
 static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     conn_data *conn = (conn_data *)handle->data;
     
@@ -103,8 +85,17 @@ static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *b
     *buf = uv_buf_init(conn->read_buf.base + conn->data_len, conn->read_buf.len - conn->data_len);
 }
 
+// uv callback for close
+static void on_close(uv_handle_t* handle) {
+    printf("on_close\n");
+    //conn_data *conn = (conn_data *)handle->data;
+    // if (conn) {
+    //     free_conn_data(conn);
+    // }
+    free(handle);
+}
 
-
+// uv callback for uv_read
 static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     conn_data *conn = (conn_data *)client->data;
 
@@ -119,7 +110,7 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         return;
     }
 
-    if (nread > 0) {
+    if (nread >= 0) {
         conn->data_len += nread;
         printf("Read %zd bytes. Total in buffer: %zu\n", nread, conn->data_len);
         if (conn->read_waker) {
@@ -129,6 +120,7 @@ static void on_read(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
     }
 }
 
+// hyper callback for read
 static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t buf_len) {
     conn_data *conn = (conn_data *)userdata;
 
@@ -151,6 +143,7 @@ static size_t read_cb(void *userdata, hyper_context *ctx, uint8_t *buf, size_t b
     return HYPER_IO_PENDING;
 }
 
+// uv callback for uv_write
 static void on_write(uv_write_t* req, int status) {
     conn_data* conn = (conn_data*)req->data;
 
@@ -166,6 +159,7 @@ static void on_write(uv_write_t* req, int status) {
     }
 }
 
+// hyper callback for write
 static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, size_t buf_len) {
     conn_data *conn = (conn_data *)userdata;
 
@@ -190,26 +184,65 @@ static size_t write_cb(void *userdata, hyper_context *ctx, const uint8_t *buf, s
     return buf_len;
 }
 
-static conn_data *create_conn_data() {
-    conn_data *conn = calloc(1, sizeof(conn_data));
-    if (!conn) {
-        fprintf(stderr, "Failed to allocate conn_data\n");
-        return NULL;
-    }
 
-    atomic_init(&conn->is_closing, false);
-    conn->read_buf = uv_buf_init(NULL, 0);
-    conn->write_buf = uv_buf_init(NULL, 0);
-    conn->data_len = 0;
+/* Hyper callback functions */
 
-    return conn;
+// hyper callback for print each header
+static int print_each_header(
+    void *userdata, const uint8_t *name, size_t name_len, const uint8_t *value, size_t value_len
+) {
+    printf("%.*s: %.*s\n", (int)name_len, name, (int)value_len, value);
+    return HYPER_ITER_CONTINUE;
 }
 
+// hyper callback for print body chunk
+static int print_body_chunk(void *userdata, const hyper_buf *chunk) {
+    const uint8_t *buf = hyper_buf_bytes(chunk);
+    size_t len = hyper_buf_len(chunk);
+    write(1, buf, len);
+    return HYPER_ITER_CONTINUE;
+}
+
+// hyper callback for send each body chunk
+static int send_each_body_chunk(void *userdata, hyper_context *ctx, hyper_buf **chunk) {
+    int *chunk_count = (int *)userdata;
+    if (*chunk_count > 0) {
+        char data[64];
+        snprintf(data, sizeof(data), "Chunk %d\n", *chunk_count);
+        *chunk = hyper_buf_copy((const uint8_t*)data, strlen(data));
+        (*chunk_count)--;
+        return HYPER_POLL_READY;
+    } else {
+        *chunk = NULL;
+        return HYPER_POLL_READY;
+    }
+}
+
+/* Cleanup functions*/
+
+// free service userdata
+static void free_service_userdata(void *userdata) {
+    service_userdata *cast_userdata = (service_userdata *)userdata;
+    if (cast_userdata != NULL) {
+        // Note: We don't free conn here because it's managed separately
+        free(cast_userdata);
+    }
+}
+
+// free conn data
 static void free_conn_data(void *userdata) {
+    printf("Closing connection...\n");
     conn_data *conn = (conn_data *)userdata;
-    printf("attempt free_conn_data\n");
+    if (!conn) {
+        printf("conn is NULL\n");
+        return;
+    }
+    if (atomic_exchange(&conn->is_closing, true)) {
+        printf("conn is already closing\n");
+        return;
+    }
+
     if (conn && !atomic_exchange(&conn->is_closing, true)) {
-        printf("Closing connection...\n");
         if (conn->read_waker) {
             hyper_waker_free(conn->read_waker);
             conn->read_waker = NULL;
@@ -227,10 +260,35 @@ static void free_conn_data(void *userdata) {
         hyper_http1_serverconn_options_free(conn->http1_opts);
         hyper_http2_serverconn_options_free(conn->http2_opts);
 
-       //free(conn);
+        if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
+            printf("Closing connection stream...\n");
+            uv_close((uv_handle_t*)&conn->stream, on_close);
+        }
+
+        // TODO: free conn
+        //free(conn);
     }
 }
 
+/* Create functions */
+
+// create conn data
+static conn_data *create_conn_data() {
+    conn_data *conn = calloc(1, sizeof(conn_data));
+    if (!conn) {
+        fprintf(stderr, "Failed to allocate conn_data\n");
+        return NULL;
+    }
+
+    atomic_init(&conn->is_closing, false);
+    conn->read_buf = uv_buf_init(NULL, 0);
+    conn->write_buf = uv_buf_init(NULL, 0);
+    conn->data_len = 0;
+
+    return conn;
+}
+
+// create io
 static hyper_io *create_io(conn_data *conn) {
     hyper_io *io = hyper_io_new();
     hyper_io_set_userdata(io, (void *)conn, free_conn_data);
@@ -240,6 +298,7 @@ static hyper_io *create_io(conn_data *conn) {
     return io;
 }
 
+// create service userdata
 static service_userdata *create_service_userdata() {
     service_userdata *userdata = (service_userdata *)calloc(1, sizeof(service_userdata));
     if (userdata == NULL) {
@@ -248,51 +307,7 @@ static service_userdata *create_service_userdata() {
     return userdata;
 }
 
-static void free_service_userdata(void *userdata) {
-    service_userdata *cast_userdata = (service_userdata *)userdata;
-    if (cast_userdata != NULL) {
-        // Note: We don't free conn here because it's managed separately
-        free(cast_userdata);
-    }
-}
-
-static int print_each_header(
-    void *userdata, const uint8_t *name, size_t name_len, const uint8_t *value, size_t value_len
-) {
-    printf("%.*s: %.*s\n", (int)name_len, name, (int)value_len, value);
-    return HYPER_ITER_CONTINUE;
-}
-
-static void on_close(uv_handle_t* handle) {
-    printf("on_close\n");
-    conn_data *conn = (conn_data *)handle->data;
-    if (conn) {
-        free_conn_data(conn);
-    }
-    free(handle);
-}
-
-static int print_body_chunk(void *userdata, const hyper_buf *chunk) {
-    const uint8_t *buf = hyper_buf_bytes(chunk);
-    size_t len = hyper_buf_len(chunk);
-    write(1, buf, len);
-    return HYPER_ITER_CONTINUE;
-}
-
-static int send_each_body_chunk(void *userdata, hyper_context *ctx, hyper_buf **chunk) {
-    int *chunk_count = (int *)userdata;
-    if (*chunk_count > 0) {
-        char data[64];
-        snprintf(data, sizeof(data), "Chunk %d\n", *chunk_count);
-        *chunk = hyper_buf_copy((const uint8_t*)data, strlen(data));
-        (*chunk_count)--;
-        return HYPER_POLL_READY;
-    } else {
-        *chunk = NULL;
-        return HYPER_POLL_READY;
-    }
-}
-
+// server callback for hyper io
 static void server_callback(void *userdata, hyper_request *request, hyper_response_channel *channel) {
     service_userdata *service_data = (service_userdata *)userdata;
     
@@ -368,6 +383,9 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         }
     }
 
+    // free request
+    hyper_request_free(request);
+
     hyper_response *response = hyper_response_new();
     if (response != NULL) {
         hyper_response_set_status(response, 200);
@@ -375,7 +393,7 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         if (rsp_headers != NULL) {
             hyper_headers_set(rsp_headers, (unsigned char *)"Content-Type", 12, (unsigned char *)"text/plain", 10);
             hyper_headers_set(rsp_headers, (unsigned char *)"Cache-Control", 13, (unsigned char *)"no-cache", 8);
-            hyper_headers_set(rsp_headers, (unsigned char *)"Connection", 10, (unsigned char *)"keep-alive", 10);
+            //hyper_headers_set(rsp_headers, (unsigned char *)"Connection", 10, (unsigned char *)"keep-alive", 10);
         } else {
             fprintf(stderr, "Error: Failed to get response headers\n");
         }
@@ -401,11 +419,10 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
     } else {
         fprintf(stderr, "Error: Failed to create response\n");
     }
-
-    hyper_request_free(request);
    // We don't close the connection here. Let hyper handle keep-alive.
 }
 
+// uv callback for new connection to create hyper server connection
 static void on_new_connection(uv_stream_t *server, int status) {
     if (status < 0) {
         fprintf(stderr, "New connection error %s\n", uv_strerror(status));
@@ -470,6 +487,55 @@ static void on_new_connection(uv_stream_t *server, int status) {
         hyper_executor_push(userdata->executor, serverconn);
     } else {
         uv_close((uv_handle_t*)&conn->stream, on_close);
+    }
+}
+
+// uv callback for signal
+static void on_signal(uv_signal_t *handle, int signum) {
+    printf("Caught signal %d... exiting\n", signum);
+    should_exit = true;
+    uv_signal_stop(&sigint_handle);
+    uv_signal_stop(&sigterm_handle);
+    uv_close((uv_handle_t*)&server, NULL);
+    uv_stop(loop);
+}
+
+// uv callback for idle
+static void on_idle(uv_idle_t* handle) {
+    hyper_task *task = hyper_executor_poll(exec);
+    while (task != NULL) {
+        if (hyper_task_type(task) == HYPER_TASK_ERROR) {
+            printf("hyper task failed with error!\n");
+
+            hyper_error *err = hyper_task_value(task);
+            printf("error code: %d\n", hyper_error_code(err));
+            uint8_t errbuf[256];
+            size_t errlen = hyper_error_print(err, errbuf, sizeof(errbuf));
+            printf("details: %.*s\n", (int)errlen, errbuf);
+
+            hyper_error_free(err);
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_EMPTY) {
+            printf("internal hyper task complete\n");
+            hyper_task_free(task);
+        } else if (hyper_task_type(task) == HYPER_TASK_SERVERCONN) {
+            printf("server connection task complete\n");
+            hyper_task_free(task);
+        }
+
+        task = hyper_executor_poll(exec);
+    }
+
+    if (should_exit) {
+        printf("Shutdown initiated, cleaning up...\n");
+        uv_idle_stop(handle);
+    }
+}
+
+// uv callback for close walk
+static void close_walk_cb(uv_handle_t* handle, void* arg) {
+    if (!uv_is_closing(handle)) {
+        uv_close(handle, NULL);
     }
 }
 
