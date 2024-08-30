@@ -29,6 +29,7 @@ typedef struct conn_data_s {
     uv_buf_t write_buf;
     uv_write_t write_req;
     atomic_bool is_closing;
+    int closed_handles;
 } conn_data;
 
 typedef struct service_userdata_s {
@@ -40,7 +41,7 @@ typedef struct service_userdata_s {
 
 static uv_loop_t *loop;
 static uv_tcp_t server;
-static uv_idle_t idle_handle;
+static uv_check_t check_handle;
 static uv_signal_t sigint_handle, sigterm_handle;
 static volatile bool should_exit = false;
 
@@ -51,7 +52,7 @@ static void on_write(uv_write_t* req, int status);
 static void on_close(uv_handle_t* handle);
 static void on_new_connection(uv_stream_t *server, int status);
 static void on_signal(uv_signal_t *handle, int signum);
-static void on_idle(uv_idle_t* handle);
+static void on_check(uv_check_t* handle);
 static void close_walk_cb(uv_handle_t* handle, void* arg);
 
 // Hyper callback functions
@@ -87,12 +88,15 @@ static void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *b
 
 // uv callback for close
 static void on_close(uv_handle_t* handle) {
-    printf("on_close\n");
-    //conn_data *conn = (conn_data *)handle->data;
-    // if (conn) {
-    //     free_conn_data(conn);
-    // }
-    free(handle);
+    conn_data* conn = (conn_data*)handle->data;
+
+    if (conn) {
+        conn->closed_handles++;
+        if (conn->closed_handles >= 1) {
+            printf("All handles closed, freeing conn data\n");
+            free(conn);
+        }
+    }
 }
 
 // uv callback for uv_read
@@ -231,18 +235,15 @@ static void free_service_userdata(void *userdata) {
 
 // free conn data
 static void free_conn_data(void *userdata) {
-    printf("Closing connection...\n");
+    printf("free_conn_data called\n");
     conn_data *conn = (conn_data *)userdata;
     if (!conn) {
         printf("conn is NULL\n");
         return;
     }
-    if (atomic_exchange(&conn->is_closing, true)) {
-        printf("conn is already closing\n");
-        return;
-    }
 
     if (conn && !atomic_exchange(&conn->is_closing, true)) {
+        printf("Closing connection...\n");
         if (conn->read_waker) {
             hyper_waker_free(conn->read_waker);
             conn->read_waker = NULL;
@@ -265,8 +266,8 @@ static void free_conn_data(void *userdata) {
             uv_close((uv_handle_t*)&conn->stream, on_close);
         }
 
-        // TODO: free conn
-        //free(conn);
+    } else {
+        printf("conn_data already closing\n");
     }
 }
 
@@ -474,7 +475,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
         hyper_service_set_userdata(service, userdata, free_service_userdata);
 
         hyper_http1_serverconn_options *http1_opts = hyper_http1_serverconn_options_new(userdata->executor);
-        hyper_http1_serverconn_options_header_read_timeout(http1_opts, 5*1000);
+        hyper_http1_serverconn_options_header_read_timeout(http1_opts, 5 * 1000);
         conn->http1_opts = http1_opts;
 
         hyper_http2_serverconn_options *http2_opts = hyper_http2_serverconn_options_new(userdata->executor);
@@ -500,8 +501,8 @@ static void on_signal(uv_signal_t *handle, int signum) {
     uv_stop(loop);
 }
 
-// uv callback for idle
-static void on_idle(uv_idle_t* handle) {
+// uv callback for check
+static void on_check(uv_check_t* handle) {
     hyper_task *task = hyper_executor_poll(exec);
     while (task != NULL) {
         if (hyper_task_type(task) == HYPER_TASK_ERROR) {
@@ -528,7 +529,7 @@ static void on_idle(uv_idle_t* handle) {
 
     if (should_exit) {
         printf("Shutdown initiated, cleaning up...\n");
-        uv_idle_stop(handle);
+        uv_check_stop(handle);
     }
 }
 
@@ -583,8 +584,8 @@ int main(int argc, char *argv[]) {
     uv_signal_init(loop, &sigterm_handle);
     uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
 
-    uv_idle_init(loop, &idle_handle);
-    uv_idle_start(&idle_handle, on_idle);
+    uv_check_init(loop, &check_handle);
+    uv_check_start(&check_handle, on_check);
 
     printf("http handshake (hyper v%s) ...\n", hyper_version());
 
