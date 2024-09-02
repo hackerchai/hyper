@@ -14,7 +14,9 @@
 #include "hyper.h"
 
 static const int MAX_EVENTS = 128;
-static const hyper_executor *exec;
+const hyper_executor *exec;
+hyper_http1_serverconn_options *http1_opts;
+hyper_http2_serverconn_options *http2_opts;
 
 typedef struct conn_data_s {
     uv_tcp_t stream;
@@ -22,8 +24,6 @@ typedef struct conn_data_s {
     uint32_t event_mask;
     hyper_waker *read_waker;
     hyper_waker *write_waker;
-    hyper_http1_serverconn_options *http1_opts;
-    hyper_http2_serverconn_options *http2_opts;
     atomic_bool is_closing;  // Add this flag to prevent double-free
     int closed_handles;
 } conn_data;
@@ -32,7 +32,6 @@ typedef struct service_userdata_s {
     char host[128];
     char port[8];
     const hyper_executor *executor;
-    conn_data *conn;  // Add this field to store the connection data
 } service_userdata;
 
 static uv_loop_t *loop;
@@ -207,16 +206,11 @@ static void free_conn_data(void *userdata) {
             conn->write_waker = NULL;
         }
 
-        hyper_http1_serverconn_options_free(conn->http1_opts);
-        hyper_http2_serverconn_options_free(conn->http2_opts);
-
         if (!uv_is_closing((uv_handle_t*)&conn->poll_handle)) {
-            printf("Closing poll handle...\n");
             uv_close((uv_handle_t*)&conn->poll_handle, on_close);
         }
 
         if (!uv_is_closing((uv_handle_t*)&conn->stream)) {
-            printf("Closing connection stream...\n");
             uv_close((uv_handle_t*)&conn->stream, on_close);
         }
     }
@@ -303,15 +297,6 @@ static int send_each_body_chunk(void *userdata, hyper_context *ctx, hyper_buf **
 // server callback for hyper io
 static void server_callback(void *userdata, hyper_request *request, hyper_response_channel *channel) {
     service_userdata *service_data = (service_userdata *)userdata;
-    
-    // We need to change how we access conn_data
-    // Instead of trying to get it from the service, we should pass it directly when creating the service
-    conn_data *conn = (conn_data *)service_data->conn;  // Assume we've added a conn field to service_userdata
-    
-    if (conn == NULL) {
-        fprintf(stderr, "Error: No connection data available\n");
-        return;
-    }
 
     printf("Handling request on connection from %s:%s\n", service_data->host, service_data->port);
 
@@ -378,8 +363,6 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         }
     }
 
-    hyper_request_free(request);
-
     hyper_response *response = hyper_response_new();
     if (response != NULL) {
         hyper_response_set_status(response, 200);
@@ -413,7 +396,9 @@ static void server_callback(void *userdata, hyper_request *request, hyper_respon
         fprintf(stderr, "Error: Failed to create response\n");
     }
 
-   // We don't close the connection here. Let hyper handle keep-alive.
+    // We don't close the connection here. Let hyper handle keep-alive.
+    // free request
+    hyper_request_free(request);
 }
 
 // uv callback for new connection to create hyper server connection
@@ -458,7 +443,6 @@ static void on_new_connection(uv_stream_t *server, int status) {
             return;
         }
         userdata->executor = exec;
-        userdata->conn = conn;
 
         struct sockaddr_storage addr;
         int addrlen = sizeof(addr);
@@ -474,24 +458,12 @@ static void on_new_connection(uv_stream_t *server, int status) {
             snprintf(userdata->port, sizeof(userdata->port), "%d", ntohs(s->sin6_port));
         }
 
-        printf("New incoming connection from (%s:%s)\n", userdata->host, userdata->port);
-
         hyper_io *io = create_io(conn);
 
         hyper_service *service = hyper_service_new(server_callback);
         hyper_service_set_userdata(service, userdata, free_service_userdata);
 
-        hyper_http1_serverconn_options *http1_opts = hyper_http1_serverconn_options_new(userdata->executor);
-        hyper_http1_serverconn_options_header_read_timeout(http1_opts, 1000 * 5);
-        conn->http1_opts = http1_opts;
-
-        hyper_http2_serverconn_options *http2_opts = hyper_http2_serverconn_options_new(userdata->executor);
-        hyper_http2_serverconn_options_keep_alive_interval(http2_opts, 5);
-        hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
-        conn->http2_opts = http2_opts;
-
         hyper_task *serverconn = hyper_serve_httpX_connection(http1_opts, http2_opts, io, service);
-        hyper_task_set_userdata(serverconn, conn, free_conn_data);
         hyper_executor_push(userdata->executor, serverconn);
     } else {
         uv_close((uv_handle_t*)&conn->poll_handle, on_close);
@@ -538,18 +510,53 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    http1_opts = hyper_http1_serverconn_options_new(exec);
+    if (http1_opts == NULL) {
+        fprintf(stderr, "Failed to create http1_opts\n");
+        return 1;
+    }
+    hyper_code result = hyper_http1_serverconn_options_header_read_timeout(http1_opts, 5 * 1000);
+    if (result != HYPERE_OK) {
+        fprintf(stderr, "Failed to set header read timeout for http1_opts\n");
+        return 1;
+    }
+
+    http2_opts = hyper_http2_serverconn_options_new(exec);
+    if (http2_opts == NULL) {
+        fprintf(stderr, "Failed to create http2_opts\n");
+        return 1;
+    }
+    result = hyper_http2_serverconn_options_keep_alive_interval(http2_opts, 5);
+    if (result != HYPERE_OK) {
+        fprintf(stderr, "Failed to set keep alive interval for http2_opts\n");
+        return 1;
+    }
+    result = hyper_http2_serverconn_options_keep_alive_timeout(http2_opts, 5);
+    if (result != HYPERE_OK) {
+        fprintf(stderr, "Failed to set keep alive timeout for http2_opts\n");
+        return 1;
+    }
+
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     const char *port = argc > 2 ? argv[2] : "1234";
     printf("listening on port %s on %s...\n", port, host);
 
     loop = uv_default_loop();
 
-    uv_tcp_init(loop, &server);
+    int r = uv_tcp_init(loop, &server);
+    if (r != 0) {
+        fprintf(stderr, "Failed to initialize server\n");
+        return 1;
+    }
 
     struct sockaddr_in addr;
-    uv_ip4_addr(host, atoi(port), &addr);
+    r = uv_ip4_addr(host, atoi(port), &addr);
+    if (r != 0) {
+        fprintf(stderr, "Failed to set address for server\n");
+        return 1;
+    }
 
-    int r = uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
+    r = uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
     if (r != 0) {
         fprintf(stderr, "Bind error %s\n", uv_strerror(r));
         return 1;
@@ -569,14 +576,38 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    uv_signal_init(loop, &sigint_handle);
-    uv_signal_start(&sigint_handle, on_signal, SIGINT);
+    r = uv_signal_init(loop, &sigint_handle);
+    if (r != 0) {
+        fprintf(stderr, "Failed to initialize signal handler for SIGINT\n");
+        return 1;
+    }
+    r = uv_signal_start(&sigint_handle, on_signal, SIGINT);
+    if (r != 0) {
+        fprintf(stderr, "Failed to start signal handler for SIGINT\n");
+        return 1;
+    }
 
-    uv_signal_init(loop, &sigterm_handle);
-    uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
+    r = uv_signal_init(loop, &sigterm_handle);
+    if (r != 0) {
+        fprintf(stderr, "Failed to initialize signal handler for SIGTERM\n");
+        return 1;
+    }
+    r = uv_signal_start(&sigterm_handle, on_signal, SIGTERM);
+    if (r != 0) {
+        fprintf(stderr, "Failed to start signal handler for SIGTERM\n");
+        return 1;
+    }
 
-    uv_check_init(loop, &check_handle);
-    uv_check_start(&check_handle, on_check);
+    r = uv_check_init(loop, &check_handle);
+    if (r != 0) {
+        fprintf(stderr, "Failed to initialize check handler\n");
+        return 1;
+    }
+    r = uv_check_start(&check_handle, on_check);
+    if (r != 0) {
+        fprintf(stderr, "Failed to start check handler\n");
+        return 1;
+    }
 
     printf("http handshake (hyper v%s) ...\n", hyper_version());
     
@@ -588,7 +619,15 @@ int main(int argc, char *argv[]) {
     uv_run(loop, UV_RUN_DEFAULT);
 
     uv_loop_close(loop);
-    hyper_executor_free(exec);
+    if (exec) {
+        hyper_executor_free(exec);
+    }
+    if (http1_opts) {
+        hyper_http1_serverconn_options_free(http1_opts);
+    }
+    if (http2_opts) {
+        hyper_http2_serverconn_options_free(http2_opts);
+    }
 
     printf("Shutdown complete.\n");
     return 0;
