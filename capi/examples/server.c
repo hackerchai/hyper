@@ -42,7 +42,6 @@ static uv_loop_t *loop;
 static uv_tcp_t server;
 static uv_check_t check_handle;
 static uv_signal_t sigint_handle, sigterm_handle;
-static uv_async_t async_handle;
 static volatile bool should_exit = false;
 
 // UV callback functions
@@ -620,12 +619,6 @@ int main(int argc, char *argv[]) {
     r = uv_check_start(&check_handle, on_check);
     if (r != 0) {
         fprintf(stderr, "Failed to start check handler\n");
-        return 1;
-    }
-
-    r = uv_async_init(loop, &async_handle, NULL);
-    if (r != 0) {
-        fprintf(stderr, "Failed to initialize async handler\n");
         return 1;
     }
 
